@@ -1,0 +1,403 @@
+---
+title: 'Bybit Perpetual Futures Screener'
+author: 'Ravi Brock'
+date: '5/20/2022'
+output: 'Table'
+purpose: 'Provides a number of statistics for Bybit perps over a given period of time'
+---
+
+# Installs and loads libraries
+```{r}
+# install.packages('jsonlite')
+# install.packages('gt')
+# install.packages('tidyverse')
+library(jsonlite)
+library(gt)
+library(tidyverse)
+```
+
+# Parameters
+```{r}
+timeframe <- 24 # Timeframe in hours
+change <- TRUE
+funding <- TRUE
+longshort_ratio <- TRUE
+beta <- TRUE
+strength <- TRUE
+speculative_index <- FALSE
+
+options(scipen = 100)
+```
+
+# Functions to transform data and pull from the API
+```{r}
+bybitdata <- function(link) {
+  contents <- httr::RETRY('GET', 
+    url = link, 
+    config = list(), 
+    body = NULL, 
+    encode = c("json"), 
+    times = 3, 
+    pause_base = 1, 
+    pause_cap = 60, 
+    pause_min = 1, 
+    handle = NULL, 
+    quiet = FALSE, 
+    terminate_on = NULL, 
+    terminate_on_success = TRUE
+    )
+    
+  if(httr::http_status(contents)$category == 'Success') {
+    contents <- httr::content(contents,
+      as = NULL,
+      type = NULL,
+      encoding = NULL
+    )
+    contents <- as.data.frame(contents)
+  }
+  
+  return(contents)
+}
+  
+flat.to.df <- function(startdf, finaldf, startcolumn, endoffset) {
+  loop.row <- 1
+  colnumber <- NCOL(finaldf)
+  maxcell <- NCOL(startdf) - endoffset
+  
+  while(startcolumn + colnumber - 1 <= maxcell) {
+    finaldf[loop.row,] <- startdf[1, startcolumn:(startcolumn + (colnumber - 1))]
+    startcolumn <- startcolumn + colnumber
+    loop.row <- loop.row + 1
+  }
+  
+  return(finaldf)
+}
+```
+
+# Converts candlelength to seconds, sets start + end time, and validates candle length
+```{r}
+candlelength <- round((timeframe * 60 / 200), digits = 0)
+
+if(candlelength < 1) {
+  candlelength <- 1
+} else if(1 < candlelength & candlelength < 3) {
+  candlelength <- 3
+} else if(2 < candlelength & candlelength < 5) {
+  candlelength <- 5
+} else if(5 < candlelength & candlelength < 15) {
+  candlelength <- 15
+} else if(15 < candlelength & candlelength < 30) {
+  candlelength <- 30
+} else if(30 < candlelength & candlelength < 60) {
+  candlelength <- 60
+} else if(60 < candlelength & candlelength < 120) {
+  candlelength <- 120
+} else if(120 < candlelength & candlelength < 240) {
+  candlelength <- 240
+} else if(240 < candlelength & candlelength < 360) {
+  candlelength <- 360
+} else if(360 < candlelength & candlelength < 720) {
+  candlelength <- 720
+} else if(720 < candlelength & candlelength < 1440) {
+  candlelength <- 'D'
+} else if(1440 < candlelength & candlelength < 10040) {
+  candlelength <- 'W'
+} else if(10080 < candlelength) {
+  print('Timeframe too long.')
+}
+
+starttime <- floor(as.numeric(as.POSIXct(Sys.time()))) - timeframe * 3600
+```
+
+# Pulls and processes list of tickers
+```{r}
+tickers <- fromJSON('https://api.bybit.com/v2/public/symbols') %>%
+  as.data.frame
+tickers <- filter(tickers, tickers$'result.quote_currency' == 'USDT') # Filters out inverse perpetuals
+tickers = tickers[-1,]
+rownames(tickers) <- 1:nrow(tickers)
+tickers <- tickers$'result.name'
+```
+
+# Pulls OHLC data for BTC and calculates per-candle deviation from VWAP
+```{r}
+# Retry logic to pull data from Bybit API
+rawdata <- bybitdata(paste('https://api.bybit.com/public/linear/kline?symbol=BTCUSDT&interval=', candlelength, '&from=', starttime, sep='', collapse=NULL))
+
+# Rearranges Bybit API data into dataframe
+btc <- data.frame('id', 'symbol', 'period', 'interval', 'starttime', 'opentime', 'volume', 'open', 'high', 'low', 'close', 'turnover')
+btc <- flat.to.df(rawdata, btc, 5, 1)
+btc <- suppressWarnings(mutate_all(btc, function(x) as.numeric(as.character(x))))
+btc <- subset(btc, select = -c(1:6))
+
+# Calculates deviation from the VWAP as a percentage for each candle
+currentrow <- 1
+maxrow <- NROW(btc)
+
+while(currentrow <= maxrow) {
+  btc[currentrow, 6] <- (btc[currentrow, 3] + btc[currentrow, 4] + btc[currentrow, 5])/3 * btc[currentrow, 1]
+  currentrow <- currentrow + 1
+}
+vwap.btc <- sum(btc$X.turnover.)/sum(btc$X.volume.)
+currentrow <- 1
+
+while(currentrow <= maxrow) {
+  btc[currentrow, 6] <- (((btc[currentrow, 3] + btc[currentrow, 4] + btc[currentrow, 5]) / 3) - vwap.btc)/vwap.btc
+  btc[currentrow, 'variancebase'] <- btc[currentrow, 6] ^ 2
+  currentrow <- currentrow + 1
+}
+variance.btc <- mean(btc$variancebase)
+```
+
+# Pulls data, writes to a 3-dimensional array with all alt price dataframes
+```{r}
+# Pull data for each ticker, write to an array
+current.ticker <- 1
+max.ticker <- NROW(tickers)
+perpdata <- data.frame(Ticker = c(NA))
+
+# Initializes 3D array with the same row count as btc df, 7 columns, and the same height as {ticker count - 1} since BTCUSDT is skipped
+alts <- array(unlist(rep(btc, NROW(tickers))), dim=c(NROW(btc), 7, NROW(tickers)))
+
+while(current.ticker <= max.ticker) {
+  # Retry logic to pull data from Bybit API
+  rawdata <- bybitdata(paste('https://api.bybit.com/public/linear/kline?symbol=', tickers[current.ticker], '&interval=', candlelength, '&from=', starttime, sep='', collapse=NULL))
+
+  # Rearranges Bybit API data into dataframe
+  alt <- data.frame('id', 'symbol', 'period', 'interval', 'starttime', 'opentime', 'volume', 'open', 'high', 'low', 'close', 'turnover')
+  alt <- flat.to.df(rawdata, alt, 5, 1)
+  alt <- suppressWarnings(mutate_all(alt, function(x) as.numeric(as.character(x))))
+  alt <- subset(alt, select = -c(1:6))
+
+  alt[1:96, 7] <- btc$variancebase
+  alt <- data.matrix(alt, rownames.force = NA)
+  alt <- alt[1:NROW(btc),]
+  alts[,,current.ticker] <- alt
+  perpdata[current.ticker,] <- tickers[current.ticker]
+  current.ticker <- current.ticker + 1
+}
+
+tickercount <- NROW(tickers)
+```
+
+# Calculates 24 hour % change per alt
+```{r}
+if(change == TRUE) {
+  maxrow <- NROW(btc)
+  current.ticker <- 1
+  
+  Change <- rep(NA, tickercount)
+  perpdata <- cbind(perpdata, Change)
+  perpdata <- as.data.frame(perpdata)
+  perpdata$Change <- as.numeric(as.character(perpdata$Change))
+  
+  while(current.ticker <= tickercount) {
+    alt <- alts[,,current.ticker]
+    alt <- as.data.frame(alt)
+    
+    perpdata[current.ticker, 'Change'] <- (alt[maxrow, 5] - alt[1, 2]) / alt[1, 2] * 100
+    current.ticker <- current.ticker + 1
+  }
+  names(perpdata)[NCOL(perpdata)] <- 'Change (%)'
+}
+```
+
+# Calculates each alt's annualized funding rate
+```{r}
+if(funding == TRUE) {
+  maxrow <- NROW(btc)
+  current.ticker <- 1
+  
+  Funding <- rep(NA, tickercount)
+  perpdata <- cbind(perpdata, Funding)
+  perpdata <- as.data.frame(perpdata)
+  perpdata$Funding <- as.numeric(as.character(perpdata$Funding))
+  
+  while(current.ticker <= tickercount) {
+    fundingrate <- httr::RETRY('GET', 
+    url = paste('https://api.bybit.com/public/linear/funding/prev-funding-rate?symbol=', tickers[current.ticker], sep='', collapse=NULL), 
+    config = list(), 
+    body = NULL, 
+    encode = c("json"), 
+    times = 3, 
+    pause_base = 1, 
+    pause_cap = 60, 
+    pause_min = 1, 
+    handle = NULL, 
+    quiet = FALSE, 
+    terminate_on = NULL, 
+    terminate_on_success = TRUE
+    )
+    
+    if(httr::http_status(fundingrate)$category == 'Success') {
+    fundingrate <- httr::content(fundingrate, 
+      as = NULL, 
+      type = NULL,
+      encoding = NULL
+      )
+    }
+    
+    fundingrate <- suppressWarnings(as.numeric(as.character(unlist(fundingrate[]))))
+    
+    perpdata[current.ticker, 'Funding'] <- fundingrate[6] * 109500
+    current.ticker <- current.ticker + 1
+  }
+  names(perpdata)[NCOL(perpdata)] <- 'Annualized Funding (%)'
+}
+```
+
+# Long-short ratio
+```{r}
+if(longshort_ratio == TRUE) {
+  maxrow <- NROW(btc)
+  current.ticker <- 1
+  
+  LSratio <- rep(NA, tickercount)
+  perpdata <- cbind(perpdata, LSratio)
+  perpdata <- as.data.frame(perpdata)
+  perpdata$LSratio <- as.numeric(as.character(perpdata$LSratio))
+  
+  while(current.ticker <= tickercount) {
+    rawdata <- bybitdata(paste('https://api.bybit.com//v2/public/account-ratio?symbol=', tickers[current.ticker], '&period=5min', sep='', collapse=NULL))
+
+    ratio <- data.frame('symbol', 'buyratio', 'sellratio', 'timestamp')
+    ratio <- flat.to.df(rawdata, ratio, 5, 1)
+    ratio <- suppressWarnings(mutate_all(ratio, function(x) as.numeric(as.character(x))))
+    
+    perpdata[current.ticker, 'LSratio'] <- (ratio[1, 2] - ratio[1, 3]) * 100
+    current.ticker <- current.ticker + 1
+  }
+  names(perpdata)[NCOL(perpdata)] <- 'Long-Short Δ'
+}
+```
+
+# Calculates beta for each candle and outputs into final dataframe
+```{r}
+if(beta == TRUE) {
+  maxrow <- NROW(btc)
+  current.ticker <- 1
+  
+  Beta <- rep(NA, tickercount)
+  perpdata <- cbind(perpdata, Beta)
+  perpdata <- as.data.frame(perpdata)
+  perpdata$Beta <- as.numeric(as.character(perpdata$Beta))
+  
+  while(current.ticker <= tickercount) {
+    currentrow <- 1
+    
+    alt <- alts[,,current.ticker]
+    alt <- as.data.frame(alt)
+    
+    while(currentrow <= maxrow) {
+        alt[currentrow, 7] <- (alt[currentrow, 3] + alt[currentrow, 4] + alt[currentrow, 5])/3 * alt[currentrow, 6]
+        currentrow <- currentrow + 1
+    }
+    vwap.alt <- sum(alt$V7)/sum(alt$V6)
+    currentrow <- 1
+      
+    while(currentrow <= maxrow) {
+      alt[currentrow, 7] <- (vwap.alt - (alt[currentrow, 3] + alt[currentrow, 4] + alt[currentrow, 5])/3)/vwap.alt
+      currentrow <- currentrow + 1
+    }
+    currentrow <- 1
+    
+    # Creates dataframe holding BTC deviation, ALT deviation, and BTC deviation * ALT deviation
+    btcalt <- data.frame('btc', 'alt', 'btc x alt')
+    while(currentrow <= maxrow) {
+      btcalt[currentrow, 'btc'] <- btc[currentrow, 7]
+      btcalt[currentrow, 'alt'] <- alt[currentrow, 7]
+      btcalt[currentrow, 'btc x alt'] <- btcalt[currentrow, 'btc'] * btcalt[currentrow, 'alt']
+      currentrow <- currentrow + 1
+    }
+    btcalt <- select(btcalt, (NCOL(btcalt) - 2):(NCOL(btcalt)))
+    btcalt <- suppressWarnings(mutate_all(btcalt, function(x) as.numeric(as.character(x))))
+    
+    # Creates dataframe holding each alt and it's beta
+    perpdata[current.ticker, 'Beta'] <- (sum(btcalt$'btc x alt') / maxrow) / variance.btc * 100
+    
+    current.ticker <- current.ticker + 1
+  }
+}
+```
+
+# Calculates strength of each alt
+```{r}
+if (strength == TRUE) {
+  maxrow <- NROW(btc)
+  current.ticker <- 1
+  
+  Strength <- rep(NA, tickercount)
+  perpdata <- cbind(perpdata, Strength)
+  perpdata <- as.data.frame(perpdata)
+  perpdata$Strength <- as.numeric(as.character(perpdata$Strength))
+  
+  while(current.ticker <= tickercount) {
+    currentrow <- 1
+    
+    alt <- alts[,,current.ticker]
+    alt <- as.data.frame(alt)
+    
+    strength.up <- 0
+    count.up <- 0
+    strength.down <- 0
+    count.down <- 0
+    
+    while(currentrow <= maxrow) {
+      open.alt <- alt[currentrow, 2]
+      close.alt <- alt[currentrow, 5]
+      open.btc <- btc[currentrow, 2]
+      close.btc <- btc[currentrow, 5]
+      
+      if(close.btc > open.btc) {
+        strength.up <- strength.up + ((close.alt - open.alt) / open.alt - (close.btc - open.btc) / open.btc)
+        count.up <- count.up + 1
+      } else if(close.btc < open.btc) {
+        strength.down <- strength.down + ((close.alt - open.alt) / open.alt - (close.btc - open.btc) / open.btc)
+        count.down <- count.down + 1
+      }
+      
+      currentrow <- currentrow + 1
+    }
+    
+    perpdata[current.ticker, 'Strength'] <- (strength.up / count.up + strength.down / count.down) * (2500)
+    current.ticker <- current.ticker + 1
+  }
+}
+```
+
+# Calculates "Speculation Index"
+```{r}
+if(speculative_index == TRUE) {
+  maxrow <- NROW(btc)
+  current.ticker <- 1
+  
+  Speculation <- rep(NA, tickercount)
+  perpdata <- cbind(perpdata, Speculation)
+  perpdata <- as.data.frame(perpdata)
+  perpdata$Speculation <- as.numeric(as.character(perpdata$Speculation))
+  
+  while(current.ticker <= tickercount) {
+    rawdata <- bybitdata(paste('https://api.bybit.com/v2/public/open-interest?symbol=', tickers[current.ticker], '&period=1h', '&limit=', timeframe, sep='', collapse=NULL))
+    
+    openinterest <- data.frame('OI', 'timestamp', 'symbol')
+    openinterest <- flat.to.df(rawdata, openinterest, 5, 1)
+    openinterest <- suppressWarnings(mutate_all(openinterest, function(x) as.numeric(as.character(x))))
+    
+    oi <- openinterest[1, 1]
+    oidelta <- openinterest[1, 1] - openinterest[timeframe, 1]
+    
+    perpdata[current.ticker, 'Speculation'] <- sum(alt$V1) / oi
+    current.ticker <- current.ticker + 1
+  }
+  names(perpdata)[NCOL(perpdata)] <- 'Speculative Index'
+}
+```
+
+# Renames columns in perpdata, rounds everything to 2 decimal points, and displays final results
+```{r}
+perpdata <- perpdata %>%
+  mutate_if(is.numeric, round, digits = 2)
+perpdata$Ticker <- gsub('USDT', '', perpdata$Ticker)
+
+view(perpdata)
+```
