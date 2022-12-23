@@ -1,0 +1,224 @@
+---
+title: 'Bybit Seasonality Analysis'
+author: 'Ravi Brock'
+date: '10/13/2022'
+output: 'Table'
+purpose: 'Calculates average change by time on Bybit perps'
+---
+
+# Installs and loads libraries
+```{r}
+# install.packages('jsonlite')
+# install.packages('gt')
+# install.packages('tidyverse')
+library(jsonlite)
+library(gt)
+library(tidyverse)
+```
+
+# Parameters
+```{r}
+period <- 168 # Length in hours to analyze seasonality over
+granularity <- 'D' # How detailed should the interperiod price change be
+lookback <- 8 # How many periods should be analyzed
+
+options(scipen = 100)
+```
+
+# Functions to transform data and pull from the API
+```{r}
+bybitdata <- function(link) {
+  contents <- httr::RETRY('GET', 
+    url = link, 
+    config = list(), 
+    body = NULL, 
+    encode = c("json"), 
+    times = 3, 
+    pause_base = 1, 
+    pause_cap = 60, 
+    pause_min = 1, 
+    handle = NULL, 
+    quiet = FALSE, 
+    terminate_on = NULL, 
+    terminate_on_success = TRUE
+    )
+    
+  if(httr::http_status(contents)$category == 'Success') {
+    contents <- httr::content(contents,
+      as = NULL,
+      type = NULL,
+      encoding = NULL
+    )
+    contents <- as.data.frame(contents)
+  }
+  
+  return(contents)
+}
+  
+flat_to_df <- function(start_df, final_df, start_column, end_offset) {
+  loop_row <- 1
+  col_number <- NCOL(final_df)
+  max_cell <- NCOL(start_df) - end_offset
+  
+  while (start_column + col_number - 1 <= max_cell) {
+    final_df[loop_row,] <- start_df[1, start_column:(start_column + (col_number - 1))]
+    start_column <- start_column + col_number
+    loop_row <- loop_row + 1
+  }
+  
+  return(final_df)
+}
+```
+
+# Sets start time and subdivisions of periods
+```{r}
+starttime <- floor(as.numeric(as.POSIXct(Sys.time()))) - lookback * period * 3600
+
+if (granularity == "D") {
+  granularity2 <- 24
+} else if (granularity == "W") {
+  granularity2 <- 168
+} else {
+  granularity2 <- granularity
+}
+```
+
+# Pulls and processes list of tickers
+```{r}
+tickers <- fromJSON('https://api.bybit.com/v2/public/symbols') %>%
+  as.data.frame
+tickers <- filter(tickers, tickers$'result.quote_currency' == 'USDT') # Filters out inverse perpetuals
+tickers_orgnl <- tickers
+tickers = tickers[-1,]
+row.names(tickers) <- 1:nrow(tickers)
+tickers <- tickers$'result.name'
+tickers_orgnl <- tickers_orgnl$'result.name'
+ticker_count <- length(tickers)
+```
+
+# Pulls OHLC data for BTC and calculates per-candle deviation from VWAP
+```{r}
+# Retry logic to pull data from Bybit API
+rawdata <- bybitdata(paste('https://api.bybit.com/public/linear/kline?symbol=BTCUSDT&interval=', granularity, '&from=', starttime, sep='', collapse=NULL))
+
+# Rearranges Bybit API data into dataframe
+btc <- data.frame('id', 'symbol', 'period', 'interval', 'starttime', 'opentime', 'volume', 'open', 'high', 'low', 'close', 'turnover')
+btc <- flat_to_df(rawdata, btc, 5, 1)
+btc <- suppressWarnings(mutate_all(btc, function(x) as.numeric(as.character(x))))
+btc <- subset(btc, select = -c(1:6))
+```
+
+# Pulls data, writes to a 3-dimensional array with all alt price dataframes
+```{r}
+# Pull data for each ticker, write to an array
+current_ticker <- 1
+max.ticker <- NROW(tickers)
+perpdata <- data.frame(Ticker = c(NA))
+
+# Initializes 3D array with the same row count as btc df, 7 columns, and the same height as {ticker count - 1} since BTCUSDT is skipped
+alts <- array(unlist(rep(btc, NROW(tickers))), dim=c(NROW(btc), 6, NROW(tickers) + 1))
+
+while (current_ticker <= max.ticker) {
+  # Retry logic to pull data from Bybit API
+  rawdata <- bybitdata(paste('https://api.bybit.com/public/linear/kline?symbol=', tickers[current_ticker], '&interval=', granularity, '&from=', starttime, sep='', collapse=NULL))
+
+  # Rearranges Bybit API data into dataframe
+  alt <- data.frame('id', 'symbol', 'period', 'interval', 'starttime', 'opentime', 'volume', 'open', 'high', 'low', 'close', 'turnover')
+  alt <- flat_to_df(rawdata, alt, 5, 1)
+  alt <- suppressWarnings(mutate_all(alt, function(x) as.numeric(as.character(x))))
+  alt <- subset(alt, select = -c(1:6))
+  if (NROW(alt) < 56) {
+    alt[(NROW(alt) + 1):56, 1:6] <- 0
+  }
+  alt <- data.matrix(alt)
+  alts[,, current_ticker + 1] <- alt
+  current_ticker <- current_ticker + 1
+}
+```
+
+# Creates new df with standard deviations per alt organized by (subset, period)
+```{r}
+max_row <- NROW(btc)
+current_ticker <- 1
+
+while (current_ticker <= ticker_count) {
+  alt <- alts[,,current_ticker]
+  alt <- as.data.frame(alt)
+  
+  current_row <- 1
+  while (current_row <= max_row) {
+    if (alt[current_row, 1] != 0) {
+      alt[current_row, 6] <- (alt[current_row, 5]  - alt[current_row, 2]) / alt[current_row, 2]
+    }
+    current_row <- current_row + 1
+  }
+  
+  alt2 <- as.data.frame(matrix(nrow = 1, ncol = period / granularity2))
+  pct_change <- as.data.frame(t(alt[,6]))
+  alt2 <- flat_to_df(pct_change, alt2, 0, 0)
+  alt2 <- data.matrix(alt2)
+  alt2 <- (alt2-mean(alt2, na.rm = TRUE))/sd(alt2, na.rm = TRUE)
+  
+  if (current_ticker == 1) {
+    alts2 <- array(unlist(rep(alt2, NROW(tickers) + 1)), dim=c(NROW(alt2), NCOL(alt2), NROW(tickers) + 1))
+  }
+  
+  alts2[,,current_ticker] <- alt2
+  current_ticker <- current_ticker + 1
+}
+```
+
+# Flattens dataframes by writing average by period into final table with 1 row per alt
+```{r}
+max_ticker <- ticker_count + 1
+current_ticker <- 1
+final_alt <- as.data.frame(matrix(nrow = 1, ncol = period / granularity2))
+
+while (current_ticker <= max_ticker) {
+  alt <- alts2[,,current_ticker]
+  alt <- as.data.frame(alt)
+  
+  max_col <- NCOL(alt)
+  start_col <- 1
+  
+  while (start_col <= max_col) {
+    final_alt[current_ticker, start_col] <- mean(alt[,start_col], na.rm = TRUE)
+    start_col <- start_col + 1
+  }
+  
+  current_ticker <- current_ticker + 1
+}
+```
+
+#Adjusts for Bitcoin seasonality
+```{r}
+adjusted_seasonality <- final_alt
+
+max_col <- NCOL(adjusted_seasonality)
+start_col <- 1
+
+while (start_col <= max_col) {
+  adjusted_seasonality[,start_col] <- adjusted_seasonality[,start_col] - adjusted_seasonality[1,start_col]
+  start_col <- start_col + 1
+}
+```
+
+# Renames columns, rounds everything to 2 decimal points, and displays final results
+```{r}
+final_alt <- cbind(tickers_orgnl, final_alt)
+final_alt <- final_alt %>%
+  mutate_if(is.numeric, round, digits = 2)
+final_alt$tickers_orgnl <- gsub('USDT', '', final_alt$tickers_orgnl)
+final_alt <- final_alt
+
+adjusted_seasonality <- cbind(tickers_orgnl, adjusted_seasonality)
+adjusted_seasonality <- adjusted_seasonality %>%
+  mutate_if(is.numeric, round, digits = 2)
+adjusted_seasonality$tickers_orgnl <- gsub('USDT', '', adjusted_seasonality$tickers_orgnl)
+
+colnames(final_alt)[1] <- "Ticker"
+colnames(adjusted_seasonality)[1] <- "Ticker"
+
+view(final_alt)
+view(adjusted_seasonality)
+```

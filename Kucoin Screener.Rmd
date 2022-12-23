@@ -1,0 +1,386 @@
+---
+title: 'Kucoin Perpetual Futures Screener'
+author: 'Ravi Brock'
+date: '5/20/2022'
+output: 'Table'
+purpose: 'Provides a number of statistics for Kucoin perps over a given period of time'
+---
+
+# Installs and loads libraries
+```{r}
+# install.packages('jsonlite')
+# install.packages('gt')
+# install.packages('tidyverse')
+library(jsonlite)
+library(gt)
+library(tidyverse)
+```
+
+# Parameters
+```{r}
+timeframe <- 24 # Timeframe in hours
+change <- TRUE
+funding <- TRUE
+beta <- TRUE
+strength <- TRUE
+speculative_index <- TRUE
+
+options(scipen = 100)
+```
+
+# Functions to transform data and pull from the API
+```{r}
+kucoindata <- function(link) {
+  contents <- httr::RETRY('GET', 
+    url = link, 
+    config = list(), 
+    body = NULL, 
+    encode = c("json"), 
+    times = 3, 
+    pause_base = 1, 
+    pause_cap = 60, 
+    pause_min = 1, 
+    handle = NULL, 
+    quiet = FALSE, 
+    terminate_on = NULL, 
+    terminate_on_success = TRUE
+    )
+    
+  if(httr::http_status(contents)$category == 'Success') {
+    contents <- httr::content(contents,
+      as = NULL,
+      type = NULL,
+      encoding = NULL
+    )
+    contents <- as.data.frame(contents)
+  }
+  
+  return(contents)
+}
+  
+flat.to.df <- function(startdf, finaldf, startcolumn, coloffset, endoffset) {
+  loop.row <- 1
+  colnumber <- NCOL(finaldf) - coloffset
+  maxcell <- NCOL(startdf) - endoffset
+  
+  while(startcolumn + colnumber - 1 <= maxcell) {
+    finaldf[loop.row,] <- startdf[1, startcolumn:(startcolumn + (colnumber - 1))]
+    startcolumn <- startcolumn + colnumber
+    loop.row <- loop.row + 1
+  }
+  
+  return(finaldf)
+}
+```
+
+# Converts candlelength to milliseconds, sets start + end time, and validates candle length
+```{r}
+candlelength <- round((timeframe * 60 / 200), digits = 0)
+
+if(candlelength < 1) {
+  candlelength <- 1
+} else if(1 < candlelength & candlelength < 5) {
+  candlelength <- 5
+} else if(5 < candlelength & candlelength < 15) {
+  candlelength <- 15
+} else if(15 < candlelength & candlelength < 30) {
+  candlelength <- 30
+} else if(30 < candlelength & candlelength < 60) {
+  candlelength <- 60
+} else if(60 < candlelength & candlelength < 120) {
+  candlelength <- 120
+} else if(120 < candlelength & candlelength < 240) {
+  candlelength <- 240
+} else if(240 < candlelength & candlelength < 480) {
+  candlelength <- 480
+} else if(480 < candlelength & candlelength < 720) {
+  candlelength <- 720
+} else if(720 < candlelength & candlelength < 1440) {
+  candlelength <- 1440
+} else if(1440 < candlelength & candlelength < 10080) {
+  candlelength <- 10080
+} else if(10080 < candlelength) {
+  print('Timeframe too long.')
+}
+
+endtime <- floor(as.numeric(as.POSIXct(Sys.time()))) * 1000
+starttime <- endtime - (timeframe * 3600000)
+```
+
+# Pulls and processes list of tickers
+```{r}
+tickers <- fromJSON('https://api-futures.kucoin.com/api/v1/contracts/active') %>%
+  as.data.frame %>% 
+  rename(
+    rootSymbol = data.rootSymbol,
+    symbol = data.symbol
+    )
+tickers <- select(filter(tickers, rootSymbol == 'USDT'), c('symbol', 'data.fundingFeeRate', 'data.openInterest', 'data.volumeOf24h')) # Filters out inverse perpetuals
+tickers = tickers[-1,]
+tickers <- transform(tickers, data.fundingFeeRate = as.numeric(data.fundingFeeRate), 
+                              #data.predictedFundingFeeRate = as.numeric(data.predictedFundingFeeRate),
+                              data.openInterest = as.numeric(data.openInterest),
+                              data.volumeOf24h = as.numeric(data.volumeOf24h))
+rownames(tickers) <- 1:nrow(tickers)
+```
+
+# Pulls OHLC data for BTC and calculates per-candle deviation from VWAP
+```{r}
+# Retry logic to pull data from Kucoin API
+rawdata <- kucoindata(paste('https://api-futures.kucoin.com/api/v1/kline/query?symbol=XBTUSDTM&granularity=', candlelength, '&from=', starttime, '&to=', endtime, sep='', collapse=NULL))
+
+# Rearranges Kucoin API data into dataframe
+btc <- data.frame('time', 'open', 'high', 'low', 'close', 'volume', 'turnover')
+btc <- flat.to.df(rawdata, btc, 2, 1, 0)
+btc <- suppressWarnings(mutate_all(btc, function(x) as.numeric(as.character(x))))
+
+# Calculates deviation from the VWAP as a percentage for each candle
+currentrow <- 1
+maxrow <- NROW(btc)
+
+while(currentrow <= maxrow) {
+  btc[currentrow, 7] <- (btc[currentrow, 3] + btc[currentrow, 4] + btc[currentrow, 5])/3 * btc[currentrow, 6]
+  currentrow <- currentrow + 1
+}
+vwap.btc <- sum(btc$X.turnover.)/sum(btc$X.volume.)
+currentrow <- 1
+
+while(currentrow <= maxrow) {
+  btc[currentrow, 7] <- (((btc[currentrow, 3] + btc[currentrow, 4] + btc[currentrow, 5]) / 3) - vwap.btc)/vwap.btc
+  btc[currentrow, 'variancebase'] <- btc[currentrow, 7] ^ 2
+  currentrow <- currentrow + 1
+}
+variance.btc <- mean(btc$variancebase)
+```
+
+# Pulls data, writes to a 3-dimensional array with all alt price dataframes
+```{r}
+# Pull data for each ticker, write to an array
+current.ticker <- 1
+max.ticker <- NROW(tickers)
+perpdata <- data.frame(Ticker = c(NA))
+
+# Initializes 3D array with the same row count as btc df, 7 columns, and the same height as {ticker count - 1} since XBTUSDTM is skipped
+alts <- array(unlist(rep(btc, NROW(tickers))), dim=c(NROW(btc), 7, NROW(tickers)))
+
+while(current.ticker <= max.ticker) {
+  # Retry logic to pull data from Kucoin API
+  rawdata <- kucoindata(paste('https://api-futures.kucoin.com/api/v1/kline/query?symbol=', tickers[current.ticker, 1], '&granularity=', candlelength, '&from=', starttime, '&to=', endtime, sep='', collapse=NULL))
+  
+  # Rearranges Kucoin API data into dataframe
+  alt <- data.frame('time', 'open', 'high', 'low', 'close', 'volume', 'turnover')
+  alt <- flat.to.df(rawdata, alt, 2, 1, 0)
+  alt <- suppressWarnings(mutate_all(alt, function(x) as.numeric(as.character(x))))
+
+  if(NROW(alt) != NROW(btc)) {
+    currentrow <- 2
+    maxrow <- NROW(btc)
+    
+    if(timeframe * 3600000 - (alt[NROW(alt), 1] - alt[1, 1]) > 0) {
+      candlegap <- (timeframe * 3600000 - (alt[NROW(alt), 1] - alt[1, 1])) / (candlelength * 60000)
+      while(candlegap > 1) {
+         alt = rbind(alt, alt[NROW(alt),])
+         alt[NROW(alt), 1] <- alt[NROW(alt) - 1,1] + candlelength * 60000
+         alt[NROW(alt), 6] <- 0
+         rownames(alt) <- 1:nrow(alt)
+         candlegap <- candlegap - 1
+      }
+    }
+
+    while(currentrow <= maxrow) {
+      candlegap <- (alt[currentrow, 1] - alt[currentrow - 1, 1]) / (candlelength * 60000)
+      newrow <- alt[currentrow - 1,]
+      while(candlegap > 1) {
+        newrow[1, 6] <- 0
+        alt <- rbind(alt[1:currentrow-1,], newrow, alt[-(1:currentrow-1),])
+        alt[currentrow, 1] <- alt[currentrow - 1, 1] + candlelength * 60000
+        rownames(alt) <- 1:nrow(alt)
+        candlegap <- candlegap - 1
+        currentrow <- currentrow + 1
+      }
+      currentrow <- currentrow + 1
+    }
+  }
+  
+  alt <- data.matrix(alt, rownames.force = NA)
+  alts[,,current.ticker] <- alt
+  perpdata[current.ticker,] <- tickers[current.ticker, 1]
+  current.ticker <- current.ticker + 1
+}
+
+tickercount <- NROW(tickers)
+```
+
+# Calculates 24 hour % change per alt
+```{r}
+if(change == TRUE) {
+  maxrow <- NROW(btc)
+  current.ticker <- 1
+  
+  Change <- rep(NA, tickercount)
+  perpdata <- cbind(perpdata, Change)
+  perpdata <- as.data.frame(perpdata)
+  perpdata$Change <- as.numeric(as.character(perpdata$Change))
+  
+  while(current.ticker <= tickercount) {
+    alt <- alts[,,current.ticker]
+    alt <- as.data.frame(alt)
+    
+    perpdata[current.ticker, 'Change'] <- (alt[maxrow, 2] - alt[1, 2]) / alt[1, 2] * 100
+    current.ticker <- current.ticker + 1
+  }
+  names(perpdata)[NCOL(perpdata)] <- 'Change (%)'
+}
+```
+
+# Calculates each alt's annualized funding rate
+```{r}
+if(funding == TRUE) {
+  maxrow <- NROW(btc)
+  current.ticker <- 1
+  
+  Funding <- rep(NA, tickercount)
+  perpdata <- cbind(perpdata, Funding)
+  perpdata <- as.data.frame(perpdata)
+  perpdata$Funding <- as.numeric(as.character(perpdata$Funding))
+  
+  while(current.ticker <= tickercount) {
+    perpdata[current.ticker, 'Funding'] <- tickers[current.ticker, 2] * 109500
+    current.ticker <- current.ticker + 1
+  }
+  names(perpdata)[NCOL(perpdata)] <- 'Annualized Funding (%)'
+}
+```
+
+
+# Calculates beta for each candle and outputs into final dataframe
+```{r}
+if(beta == TRUE) {
+  maxrow <- NROW(btc)
+  current.ticker <- 1
+  
+  Beta <- rep(NA, tickercount)
+  perpdata <- cbind(perpdata, Beta)
+  perpdata <- as.data.frame(perpdata)
+  perpdata$Beta <- as.numeric(as.character(perpdata$Beta))
+  
+  while(current.ticker <= tickercount) {
+    currentrow <- 1
+    
+    alt <- alts[,,current.ticker]
+    alt <- as.data.frame(alt)
+    
+    while(currentrow <= maxrow) {
+        alt[currentrow, 7] <- (alt[currentrow, 3] + alt[currentrow, 4] + alt[currentrow, 5])/3 * alt[currentrow, 6]
+        currentrow <- currentrow + 1
+    }
+    vwap.alt <- sum(alt$V7)/sum(alt$V6)
+    currentrow <- 1
+      
+    while(currentrow <= maxrow) {
+      alt[currentrow, 7] <- (vwap.alt - (alt[currentrow, 3] + alt[currentrow, 4] + alt[currentrow, 5])/3)/vwap.alt
+      currentrow <- currentrow + 1
+    }
+    currentrow <- 1
+    
+    # Creates dataframe holding BTC deviation, ALT deviation, and BTC deviation * ALT deviation
+    btcalt <- data.frame('btc', 'alt', 'btc x alt')
+    while(currentrow <= maxrow) {
+      btcalt[currentrow, 'btc'] <- btc[currentrow, 7]
+      btcalt[currentrow, 'alt'] <- alt[currentrow, 7]
+      btcalt[currentrow, 'btc x alt'] <- btcalt[currentrow, 'btc'] * btcalt[currentrow, 'alt']
+      currentrow <- currentrow + 1
+    }
+    btcalt <- select(btcalt, (NCOL(btcalt) - 2):(NCOL(btcalt)))
+    btcalt <- mutate_all(btcalt, function(x) as.numeric(as.character(x)))
+    
+    # Creates dataframe holding each alt and it's beta
+    perpdata[current.ticker, 'Beta'] <- (sum(btcalt$'btc x alt') / maxrow) / variance.btc
+    
+    current.ticker <- current.ticker + 1
+  }
+}
+```
+
+# Calculates strength of each alt
+```{r}
+if (strength == TRUE) {
+  maxrow <- NROW(btc)
+  current.ticker <- 1
+  
+  Strength <- rep(NA, tickercount)
+  perpdata <- cbind(perpdata, Strength)
+  perpdata <- as.data.frame(perpdata)
+  perpdata$Strength <- as.numeric(as.character(perpdata$Strength))
+  
+  while(current.ticker <= tickercount) {
+    currentrow <- 1
+    
+    alt <- alts[,,current.ticker]
+    alt <- as.data.frame(alt)
+    
+    strength.up <- 0
+    count.up <- 0
+    strength.down <- 0
+    count.down <- 0
+    
+    while(currentrow <= maxrow) {
+      open.alt <- alt[currentrow, 2]
+      close.alt <- alt[currentrow, 5]
+      open.btc <- btc[currentrow, 2]
+      close.btc <- btc[currentrow, 5]
+      
+      if(close.btc > open.btc) {
+        strength.up <- strength.up + ((close.alt - open.alt) / open.alt - (close.btc - open.btc) / open.btc)
+        count.up <- count.up + 1
+      } else if(close.btc < open.btc) {
+        strength.down <- strength.down + ((close.alt - open.alt) / open.alt - (close.btc - open.btc) / open.btc)
+        count.down <- count.down + 1
+      }
+      
+      currentrow <- currentrow + 1
+    }
+    
+    perpdata[current.ticker, 'Strength'] <- (strength.up / count.up + strength.down / count.down) * (2500)
+    current.ticker <- current.ticker + 1
+  }
+}
+```
+
+# Calculates "Speculation Index"
+```{r}
+if(speculative_index == TRUE) {
+  maxrow <- NROW(btc)
+  current.ticker <- 1
+  
+  Speculation <- rep(NA, tickercount)
+  perpdata <- cbind(perpdata, Speculation)
+  perpdata <- as.data.frame(perpdata)
+  perpdata$Speculation <- as.numeric(as.character(perpdata$Speculation))
+  
+  while(current.ticker <= tickercount) {
+    currentrow <- 1
+    alt <- alts[,,current.ticker]
+    alt <- as.data.frame(alt)
+    
+    while(currentrow <= maxrow) {
+        alt[currentrow, 7] <- (alt[currentrow, 3] + alt[currentrow, 4] + alt[currentrow, 5])/3 * alt[currentrow, 6]
+        currentrow <- currentrow + 1
+    }
+    vwap.alt <- sum(alt$V7)/sum(alt$V6)
+    
+    perpdata[current.ticker, 'Speculation'] <- sum(alt$V6) / tickers[current.ticker, 3]
+    current.ticker <- current.ticker + 1
+  }
+  names(perpdata)[NCOL(perpdata)] <- 'Speculative Index'
+}
+```
+
+# Renames columns in perpdata, rounds everything to 2 decimal points, and displays final results
+```{r}
+perpdata <- perpdata %>%
+  mutate_if(is.numeric, round, digits = 2)
+perpdata$Ticker <- gsub('USDTM', '', perpdata$Ticker)
+
+view(perpdata)
+```
