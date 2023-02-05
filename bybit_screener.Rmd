@@ -237,9 +237,9 @@ if(funding == TRUE) {
       )
     }
     
-    fundingrate <- suppressWarnings(as.numeric(as.character(unlist(fundingrate[]))))
+    fundingrate <- fundingrate$result$funding_rate
     
-    perpdata[current.ticker, 'Funding'] <- fundingrate[6] * 109500
+    perpdata[current.ticker, 'Funding'] <- fundingrate * 109500
     current.ticker <- current.ticker + 1
   }
   names(perpdata)[NCOL(perpdata)] <- 'Annualized Funding (%)'
@@ -264,7 +264,7 @@ if(longshort_ratio == TRUE) {
     ratio <- flat.to.df(rawdata, ratio, 5, 1)
     ratio <- suppressWarnings(mutate_all(ratio, function(x) as.numeric(as.character(x))))
     
-    perpdata[current.ticker, 'LSratio'] <- (ratio[1, 2] - ratio[1, 3]) * 100
+    perpdata[current.ticker, 'LSratio'] <- (ratio[1, 4] - ratio[1, 1]) * 100
     current.ticker <- current.ticker + 1
   }
   names(perpdata)[NCOL(perpdata)] <- 'Long-Short Δ'
