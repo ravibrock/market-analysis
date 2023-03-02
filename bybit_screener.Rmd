@@ -23,7 +23,8 @@ change <- TRUE
 funding <- TRUE
 longshort_ratio <- TRUE
 beta <- TRUE
-strength <- TRUE
+strength <- FALSE
+fperformance <- TRUE
 speculative_index <- FALSE
 
 options(scipen = 100)
@@ -164,7 +165,7 @@ while(current.ticker <= max.ticker) {
   rawdata <- bybitdata(paste('https://api.bybit.com/public/linear/kline?symbol=', tickers[current.ticker], '&interval=', candlelength, '&from=', starttime, sep='', collapse=NULL))
 
   # Rearranges Bybit API data into dataframe
-  alt <- data.frame('id', 'symbol', 'period', 'interval', 'starttime', 'opentime', 'volume', 'open', 'high', 'low', 'close', 'turnover')
+  alt <- data.frame('id', 'symbol', 'period', 'interval', 'starttime', 'opentime', 'open', 'high', 'low', 'close', 'volume', 'turnover')
   alt <- flat.to.df(rawdata, alt, 5, 1)
   alt <- suppressWarnings(mutate_all(alt, function(x) as.numeric(as.character(x))))
   alt <- subset(alt, select = -c(1:6))
@@ -195,7 +196,7 @@ if(change == TRUE) {
     alt <- alts[,,current.ticker]
     alt <- as.data.frame(alt)
     
-    perpdata[current.ticker, 'Change'] <- (alt[maxrow, 5] - alt[1, 2]) / alt[1, 2] * 100
+    perpdata[current.ticker, 'Change'] <- (alt[maxrow, 4] - alt[1, 1]) / alt[1, 1] * 100
     current.ticker <- current.ticker + 1
   }
   names(perpdata)[NCOL(perpdata)] <- 'Change (%)'
@@ -343,10 +344,10 @@ if (strength == TRUE) {
     count.down <- 0
     
     while(currentrow <= maxrow) {
-      open.alt <- alt[currentrow, 2]
-      close.alt <- alt[currentrow, 5]
-      open.btc <- btc[currentrow, 2]
-      close.btc <- btc[currentrow, 5]
+      open.alt <- alt[currentrow, 1]
+      close.alt <- alt[currentrow, 4]
+      open.btc <- btc[currentrow, 1]
+      close.btc <- btc[currentrow, 4]
       
       if(close.btc > open.btc) {
         strength.up <- strength.up + ((close.alt - open.alt) / open.alt - (close.btc - open.btc) / open.btc)
@@ -362,6 +363,21 @@ if (strength == TRUE) {
     perpdata[current.ticker, 'Strength'] <- (strength.up / count.up + strength.down / count.down) * (2500)
     current.ticker <- current.ticker + 1
   }
+}
+```
+
+# Funding-adjusted performance
+```{r}
+if(fperformance == TRUE) {
+  maxrow <- NROW(btc)
+  current.ticker <- 1
+  
+  FPerformance <- rep(NA, tickercount)
+  perpdata <- cbind(perpdata, FPerformance)
+  perpdata <- as.data.frame(perpdata)
+  perpdata$FPerformance <- as.numeric(as.character(perpdata$FPerformance))
+  
+  perpdata$FPerformance <- perpdata$`Change (%)` * perpdata$`Annualized Funding (%)`
 }
 ```
 
