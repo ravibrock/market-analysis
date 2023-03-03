@@ -368,7 +368,7 @@ if (strength == TRUE) {
 
 # Funding-adjusted performance
 ```{r}
-if(fperformance == TRUE) {
+if(funding == TRUE & fperformance == TRUE) {
   maxrow <- NROW(btc)
   current.ticker <- 1
   
