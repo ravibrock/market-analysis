@@ -1,0 +1,251 @@
+---
+title: 'Bybit Perpetual Futures Screener'
+author: 'Ravi Brock'
+date: '4/18/2023'
+output: pdf_document
+purpose: 'Charts regular and log returns for all Bybit alts'
+---
+
+# Installs and loads libraries
+```{r}
+# install.packages('jsonlite')
+# install.packages('directlabels')
+# install.packages('gt')
+# install.packages("reshape")
+# install.packages
+library(directlabels)
+library(jsonlite)
+library(gt)
+library(reshape)
+library(tidyverse)
+```
+
+# Parameters
+```{r}
+start_time <- 1681858800 # Start time (unix timestamp)
+data_source <- "CLOSE" # OPEN, HIGH, LOW, or CLOSE
+
+options(scipen = 100)
+```
+
+# Functions to transform data and pull from the API
+```{r}
+bybitdata <- function(link) {
+  contents <- httr::RETRY('GET', 
+    url = link, 
+    config = list(), 
+    body = NULL, 
+    encode = c("json"), 
+    times = 3, 
+    pause_base = 1, 
+    pause_cap = 60, 
+    pause_min = 1, 
+    handle = NULL, 
+    quiet = FALSE, 
+    terminate_on = NULL, 
+    terminate_on_success = TRUE
+    )
+    
+  if(httr::http_status(contents)$category == 'Success') {
+    contents <- httr::content(contents, 
+      as = NULL, 
+      type = NULL, 
+      encoding = NULL
+    )
+    contents <- as.data.frame(contents)
+  }
+  
+  return(contents)
+}
+  
+flat.to.df <- function(startdf, finaldf, startcolumn, endoffset) {
+  lp.row <- 1
+  colnumber <- NCOL(finaldf)
+  maxcell <- NCOL(startdf) - endoffset
+  
+  while(startcolumn + colnumber - 1 <= maxcell) {
+    finaldf[lp.row, ] <- startdf[1, startcolumn:(startcolumn + (colnumber - 1))]
+    startcolumn <- startcolumn + colnumber
+    lp.row <- lp.row + 1
+  }
+  
+  return(finaldf)
+}
+```
+
+# Sets candlelength
+```{r}
+candlelength <- (as.numeric(Sys.time()) - start_time)/12000
+
+if(candlelength < 1) {
+  candlelength <- 1
+} else if(1 < candlelength & candlelength < 3) {
+  candlelength <- 3
+} else if(2 < candlelength & candlelength < 5) {
+  candlelength <- 5
+} else if(5 < candlelength & candlelength < 15) {
+  candlelength <- 15
+} else if(15 < candlelength & candlelength < 30) {
+  candlelength <- 30
+} else if(30 < candlelength & candlelength < 60) {
+  candlelength <- 60
+} else if(60 < candlelength & candlelength < 120) {
+  candlelength <- 120
+} else if(120 < candlelength & candlelength < 240) {
+  candlelength <- 240
+} else if(240 < candlelength & candlelength < 360) {
+  candlelength <- 360
+} else if(360 < candlelength & candlelength < 720) {
+  candlelength <- 720
+} else if(720 < candlelength & candlelength < 1440) {
+  candlelength <- 'D'
+} else if(1440 < candlelength & candlelength < 10040) {
+  candlelength <- 'W'
+} else if(10080 < candlelength) {
+  stop("Timeframe too long.")
+}
+```
+
+# Transforms data source into column number
+```{r}
+if(data_source == "OPEN") {
+  data_source <- 2
+} else if (data_source == "HIGH") {
+  data_source <- 3
+} else if (data_source == "LOW") {
+  data_source <- 4
+} else if (data_source == "CLOSE") {
+  data_source <- 5
+} else {
+  stop("Incorrect value for `data_source`.")
+}
+```
+
+# Pulls and processes list of tickers
+```{r}
+tickers_original <- fromJSON('https://api.bybit.com/v2/public/symbols') %>%
+  as.data.frame
+tickers_original <- filter(tickers_original,
+                           tickers_original$'result.quote_currency' == 'USDT')
+tickers <- filter(tickers_original,
+                  tickers_original$'result.name' != 'BTCUSDT')
+tickers <- tickers$'result.name'
+```
+
+# Pulls OHLC data for BTC and calculates per-candle deviation from VWAP
+```{r}
+# Retry logic to pull data from Bybit API
+url <- paste('https://api.bybit.com/public/linear/kline?symbol=',
+             'BTCUSDT',
+             '&interval=',
+             candlelength,
+             '&from=',
+             start_time,
+             sep='',
+             collapse=NULL)
+rawdata <- bybitdata(url)
+
+# Rearranges Bybit API data into dataframe
+btc <- data.frame('id',
+                  'symbol',
+                  'period',
+                  'interval',
+                  'start_time',
+                  'opentime',
+                  'volume',
+                  'open',
+                  'high',
+                  'low',
+                  'close',
+                  'turnover')
+btc <- flat.to.df(rawdata, btc, 5, 1)
+numeric <- function(x) as.numeric(as.character(x))
+btc <- suppressWarnings(mutate_all(btc, numeric))
+btc <- subset(btc, select = c(6:10))
+```
+
+# Pulls data, writes to a 3-dimensional array with all alt price dataframes
+```{r}
+# Pull data for each ticker, write to an array
+current.ticker <- 1
+max.ticker <- NROW(tickers)
+perpdata <- data.frame(Ticker = c(NA))
+
+# Initializes 3D array
+alts <- array(unlist(rep(btc,
+                         NROW(tickers))),
+                         dim=c(NROW(btc),
+                         5,
+                         NROW(tickers)+1))
+alts[, , 1] <- data.matrix(btc, rownames.force = NA)
+
+while(current.ticker <= max.ticker) {
+  # Retry logic to pull data from Bybit API
+  url <- paste('https://api.bybit.com/public/linear/kline?symbol=',
+               tickers[current.ticker],
+               '&interval=',
+               candlelength,
+               '&from=',
+               start_time,
+               sep='',
+               collapse=NULL)
+  rawdata <- bybitdata(url)
+
+  # Rearranges Bybit API data into dataframe
+  alt <- data.frame('id',
+                    'symbol',
+                    'period',
+                    'interval',
+                    'start_time',
+                    'opentime',
+                    'open',
+                    'high',
+                    'low',
+                    'close',
+                    'volume',
+                    'turnover')
+  alt <- flat.to.df(rawdata, alt, 5, 1)
+  alt <- suppressWarnings(mutate_all(alt, numeric))
+  alt <- subset(alt, select = c(6:10))
+
+  # Converts to matrix and adds to next row
+  alt <- data.matrix(alt, rownames.force = NA)
+  alt <- alt[1:NROW(btc), ]
+  alts[, , current.ticker+1] <- alt
+  perpdata[current.ticker, ] <- tickers[current.ticker]
+  current.ticker <- current.ticker + 1
+}
+
+tickercount <- NROW(tickers)
+```
+
+# Isolates the time series from the given data source into dataframe
+```{r}
+alts_df <- data.frame(matrix(nrow=NROW(btc), ncol=NROW(tickers)+1))
+
+i = 1
+while (i <= NROW(tickers) + 1) {
+  alts_df[, i] <- alts[, data_source, i]
+  i <- i + 1
+}
+
+alts_df <- cbind(btc[, 1], alts_df)
+colnames(alts_df) <- c('timestamp', 'BTCUSDT', tickers)
+
+pct_change <- function(x) ((x - x[1]) / x[1] * 100)
+alts_pct <- alts_df
+alts_pct[, -1] <- mutate_all(alts_df[, -1], pct_change)
+alts_pct[1, -1] <- 0
+```
+
+# Plots everything
+```{r fig.align="center", fig.width = 25}
+alts_melt <- melt(alts_pct[, 1:90], id = "timestamp")
+alts_melt$timestamp <- as.POSIXct(alts_melt$timestamp, origin = "1970-01-01")
+colnames(alts_melt) <- c("time", "variable", "pct_change")
+
+ggplot(data = alts_melt, aes(x = time, y = pct_change, color = variable)) +
+  geom_line() +
+  scale_color_discrete(guide = 'none') +
+  geom_dl(aes(label = variable), method = list(dl.combine("last.points")))
+```
